@@ -1,0 +1,731 @@
+---
+title: 'Domoic Acid Levels in Northern California Crabs: Data Exploration and Prediction'
+author: "Pasha Foroudi"
+date: "July 26, 2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+#Libraries Used
+```{r}
+library(pacman) #pacman package allows mass loading in single "p_load" command
+p_load(tidyverse, lubridate, tm, tidytext, pdftools, rpart, partykit, mosaic, randomForest, caret)
+#library(tidyverse) #tidyverse notably loads packages such as dplyr, tidyr, ggplot2, tibble-- among others.
+#library(lubridate) #indispensible for working with dates/times
+#library(tm)       #valuable package for text mining in R
+#library(tidytext) #^
+#library(pdftools) #valuable library for tasks involving PDFs
+#remainder of packages: machine learning packages
+```
+
+#Import Data
+Periodic data reports of Domoic Acid levels in crabs are released by the CA Dept. of Public Health's (CDPH)
+Center for Environmental Health, Division of Food and Drug. Said reports are provided in PDF format. 
+As such, the following code mines the data from the PDFs linked on CDPH's website.
+
+
+```{r}
+#for loop for extracting PDF data for years 2015-2018
+da_15_18_txt <- list() #initialise list
+
+dat_dates <- c('15-16', '16-17', '17-18')  
+
+for (i in dat_dates){
+  URL <- paste0('https://www.cdph.ca.gov/Programs/CEH/DFDCS/CDPH%20Document%20Library/FDB/FoodSafetyProgram/DomoicAcid/CrabDA',i,'.pdf')
+  da_15_18_txt[[i]] <- pdf_text(URL)
+}
+
+
+# 2019 separate due to URL difference
+da_19_raw_txt <- pdf_text(
+  url('https://www.cdph.ca.gov/Programs/CEH/DFDCS/CDPH%20Document%20Library/FDB/FoodSafetyProgram/DomoicAcid/Crab%20DA%20Web%20Results%20July%201%202018%20to%20June%2025%202019.pdf')) 
+
+#optional save of raw text
+#saveRDS(object = da_15_18_txt, file = "da_15_18_txt")
+#saveRDS(object = da_19_raw_txt, file = "da_19_raw_txt")
+
+##optional read of saved raw text for future use
+#da_15_18_txt <- readRDS("da_15_18_txt")
+#da_19_raw_txt <- readRDS('da_19_raw_txt')
+
+
+#place from list into individual yearly frames
+da_16 <- da_15_18_txt[[1]]                                                  
+da_17 <- da_15_18_txt[[2]]
+da_18 <- da_15_18_txt[[3]]
+```
+
+#Text Mining the Data
+As exampled above, the data is *not* in a work-able state. The following text mining techniques were utilized to deliver the data to a tidy state:
+
+##2015-2016 Data Cleaning
+```{r}
+da_16 <- da_16 %>% 
+  tibble() %>%                        #places vector into data frame
+  unnest_tokens(output = lines,       #name the output column
+                input = da_16,        #identify input
+                token = "lines") %>%  #ID the type of unit for tokenizing
+  select(lines) %>%                   #select only output column in output
+  filter(grepl("%", x = lines)) %>%   #retain only data lines 
+  distinct()                          #remove duplicates
+
+#Region had to be *manually* input for this PDF
+da_16$region <- "Crescent City"
+da_16$region[15:55] <- "Eureka/Trinidad"
+da_16$region[56:77] <- "Fort Bragg"
+da_16$region[78:108] <- "Bodega Bay"
+da_16$region[109:130] <- "Half Moon Bay/SF"
+da_16$region[131:153] <- "Monterey"
+da_16$region[154:163] <- "Morro Bay"
+da_16$region[164:233] <- "Santa Barbara"
+
+#Extract Date
+da_16$collect_date <- str_extract_all(string = da_16$lines, pattern = "\\d+/\\d+/\\d+", simplify = T)
+
+#manual entry due to misread:
+da_16$collect_date[104] <- '3/10/16'
+da_16$collect_date[128] <- '6/11/16'
+
+#Extract Sample Size
+da_16$n <- as.numeric(str_extract(string = da_16$lines, pattern = " .\\d "))
+
+#Extract Percent of Samples Over FDA limit
+da_16$pct <- str_extract(string = da_16$lines, pattern = ".\\d[[%]]") %>% 
+  removePunctuation() %>% 
+  as.numeric()
+```
+##2016-2017 Data Cleaning
+```{r}
+da_17 <- da_17 %>% 
+  tibble() %>%                        #places vector into data frame
+  unnest_tokens(output = lines,       #name the output column
+                input = da_17,        #identify input
+                token = "lines") %>%  #ID the type of unit for tokenizing
+  select(lines) %>%                   #select only output column in output
+  filter(grepl("%", x = lines)) %>%   #retain only data lines 
+  distinct()                          #remove duplicates
+
+
+# obtain unique locations to assign 
+unique(str_replace_all(string = da_17$lines, pattern = "(?=\\d).*", replacement = "")) # obtain unique locations to assign 
+
+#regex expressions of sample locations -to-> stored vectors for all case_when statements to follow
+
+Crescent_City <- paste(c("[[:blank:]]george reef[[:blank:]]","[[:blank:]]klamath river[[:blank:]]"), collapse = '|')
+
+Trinidad <- paste(c("[[:blank:]]trinidad[[:blank:]]"),collapse = '|')
+
+Eureka <- paste(c("[[:blank:]]eureka[[:blank:]]","[[:blank:]]humboldt bay[[:blank:]]","[[:blank:]]samoa[[:blank:]]",
+                  "[[:blank:]]eel river[[:blank:]]","[[:blank:]]cape mendocino[[:blank:]]","[[:blank:]]punta gorda[[:blank:]] "),
+                collapse = '|')
+
+Fort_Bragg <- paste(c("[[:blank:]]usal[[:blank:]]","[[:blank:]]pt. arena[[:blank:]]","[[:blank:]]shelter cove[[:blank:]]", 
+                      "[[:blank:]]king range[[:blank:]]", "[[:blank:]]ten mile[[:blank:]]","[[:blank:]]point arena[[:blank:]]"),
+                    collapse = '|')
+
+Bodega_Bay <- paste(c("[[:blank:]]point reyes[[:blank:]]","[[:blank:]]russian river[[:blank:]]","[[:blank:]]bodega head[[:blank:]]",
+                      "[[:blank:]]salt point[[:blank:]]","[[:blank:]]bodega bay[[:blank:]]","[[:blank:]]gualala[[:blank:]]",
+                      "[[:blank:]]black point[[:blank:]]" ), collapse = '|')
+
+HMB_SF <- paste(c("[[:blank:]]pillar point[[:blank:]]","[[:blank:]]bonita cove[[:blank:]]","[[:blank:]]point diablo[[:blank:]]",
+                  '[[:blank:]]pigeon point[[:blank:]]', '[[:blank:]]san francisco[[:blank:]]','[[:blank:]]duxbury[[:blank:]]'), 
+                collapse = '|')
+
+Monterey <- paste(c("[[:blank:]] monterey bay[[:blank:]]","[[:blank:]] santa cruz[[:blank:]]"), collapse = '|')
+
+Morro_Bay <- "[[:blank:]]avila[[:blank:]]"
+
+SB <- paste(c('[[:blank:]]santa barbara[[:blank:]]','[[:blank:]]santa rosa[[:blank:]]','[[:blank:]]island[[:blank:]]',
+              '[[:blank:]]port hueneme[[:blank:]]'), collapse = '|')
+
+SD <- '[[:blank:]]san diego[[:blank:]]'
+
+#regions addressed via case_when statements
+da_17$region <- case_when(
+  grepl(pattern = Crescent_City, x = da_17$lines, ignore.case = T) ~ "Crescent City",
+  grepl(pattern = Trinidad, x = da_17$lines, ignore.case = T) ~ "Eureka/Trinidad",
+  grepl(pattern = Eureka, x = da_17$lines, ignore.case = T) ~ "Eureka/Trinidad",
+  grepl(pattern = Fort_Bragg, x = da_17$lines, ignore.case = T) ~ "Fort Bragg",
+  grepl(pattern = Bodega_Bay, x = da_17$lines, ignore.case = T) ~ "Bodega Bay",
+  grepl(pattern = HMB_SF, x = da_17$lines, ignore.case = T) ~ "Half Moon Bay/SF",
+  grepl(pattern = Monterey, x = da_17$lines, ignore.case = T) ~ "Monterey",
+  grepl(pattern = Morro_Bay, x = da_17$lines, ignore.case = T) ~ "Morro Bay",
+  grepl(pattern = SB, x = da_17$lines, ignore.case = T) ~ "Santa Barbara",
+  grepl(pattern = SD, x = da_17$lines, ignore.case = T) ~ "San Diego"
+)
+
+#regions that had to be *manually* input due to PDF reading
+da_17$region[1:3] <- "Crescent City"
+da_17$region[4:6] <- "Eureka/Trinidad"
+da_17$region[c(70,72)] <- "Santa Barbara"
+
+
+#Extract Date
+da_17$collect_date <- str_extract_all(string = da_17$lines, pattern = "\\d+/\\d+/\\d+", simplify = T)
+
+#Extract Sample Size
+da_17$n <- as.numeric(str_extract(string = da_17$lines, pattern = " .\\d "))
+
+#Extract Percent of Samples Over FDA limit
+da_17$pct <- str_extract(string = da_17$lines, pattern = ".\\d[[%]]") %>% 
+  removePunctuation() %>% 
+  as.numeric()
+```
+##2017-2018 Data Cleaning
+```{r}
+da_18 <- da_18 %>% 
+  tibble() %>%                        #places vector into data frame
+  unnest_tokens(output = lines,       #name the output column
+                input = da_18,        #identify input
+                token = "lines") %>%  #ID the type of unit for tokenizing
+  select(lines) %>%                   #select only output column in output
+  filter(grepl("%", x = lines)) %>%   #retain only data lines 
+  distinct()                          #remove duplicates
+
+da_18$region <- case_when(
+  grepl(pattern = Crescent_City, x = da_18$lines, ignore.case = T) ~ "Crescent City",
+  grepl(pattern = Trinidad, x = da_18$lines, ignore.case = T) ~ "Eureka/Trinidad",
+  grepl(pattern = Eureka, x = da_18$lines, ignore.case = T) ~ "Eureka/Trinidad",
+  grepl(pattern = Fort_Bragg, x = da_18$lines, ignore.case = T) ~ "Fort Bragg",
+  grepl(pattern = Bodega_Bay, x = da_18$lines, ignore.case = T) ~ "Bodega Bay",
+  grepl(pattern = HMB_SF, x = da_18$lines, ignore.case = T) ~ "Half Moon Bay/SF",
+  grepl(pattern = Monterey, x = da_18$lines, ignore.case = T) ~ "Monterey",
+  grepl(pattern = Morro_Bay, x = da_18$lines, ignore.case = T) ~ "Morro Bay",
+  grepl(pattern = SB, x = da_18$lines, ignore.case = T) ~ "Santa Barbara",
+  grepl(pattern = SD, x = da_18$lines, ignore.case = T) ~ "San Diego"
+)
+
+#regions that had to be *manually* input due to PDF reading
+da_18$region[46] <- "Santa Barbara"
+
+#Extract Date
+da_18$collect_date <- str_extract_all(string = da_18$lines, pattern = "\\d+/\\d+/\\d+", simplify = T)
+
+#Extract Sample Size
+da_18$n <- as.numeric(str_extract(string = da_18$lines, pattern = " .\\d "))
+
+#Extract Percent of Samples Over FDA limit
+da_18$pct <- str_extract(string = da_18$lines, pattern = ".\\d[[%]]") %>% 
+  removePunctuation() %>% 
+  as.numeric()
+```
+
+##2018-2019 Data Cleaning
+```{r}
+da_19 <- da_19_raw_txt %>% 
+  tibble() %>%                        #places vector into data frame
+  unnest_tokens(output = lines,       #name the output column
+                input = da_19_raw_txt,        #identify input
+                token = "lines") %>%  #ID the type of unit for tokenizing
+  select(lines) %>%                   #select only output column in output
+  filter(grepl("%", x = lines)) %>%   #retain only data lines 
+  distinct()                          #remove duplicates
+
+#regions addressed via case_when statements
+da_19$region <- case_when(
+  grepl(pattern = Crescent_City, x = da_19$lines, ignore.case = T) ~ "Crescent City",
+  grepl(pattern = Trinidad, x = da_19$lines, ignore.case = T) ~ "Eureka/Trinidad",
+  grepl(pattern = Eureka, x = da_19$lines, ignore.case = T) ~ "Eureka/Trinidad",
+  grepl(pattern = Fort_Bragg, x = da_19$lines, ignore.case = T) ~ "Fort Bragg",
+  grepl(pattern = Bodega_Bay, x = da_19$lines, ignore.case = T) ~ "Bodega Bay",
+  grepl(pattern = HMB_SF, x = da_19$lines, ignore.case = T) ~ "Half Moon Bay/SF",
+  grepl(pattern = Monterey, x = da_19$lines, ignore.case = T) ~ "Monterey",
+  grepl(pattern = Morro_Bay, x = da_19$lines, ignore.case = T) ~ "Morro Bay",
+  grepl(pattern = SB, x = da_19$lines, ignore.case = T) ~ "Santa Barbara",
+  grepl(pattern = SD, x = da_19$lines, ignore.case = T) ~ "San Diego"
+)
+
+#Extract Date
+da_19$collect_date <- str_extract_all(string = da_19$lines, pattern = "\\d+/\\d+/\\d+", simplify = T)
+
+#Extract Sample Size
+da_19$n <- as.numeric(str_extract(string = da_19$lines, pattern = "[[:blank:]]\\d[[:blank:]]"))
+
+#Extract Percent of Samples Over FDA limit
+da_19$pct <- str_extract(string = da_19$lines, pattern = ".\\d[[%]]") %>% 
+  removePunctuation() %>% 
+  as.numeric()
+```
+
+##Merge Data Frames
+```{r}
+da_compiled <- bind_rows(da_16, da_17, da_18, da_19) #merge into one data frame
+
+#remove(da_16, da_17, da_18, da_19)    #optional: delete previous frames, to free up RAM
+
+#filter out SB and SD regions... this report is for NorCal waters
+da_compiled <- da_compiled %>% 
+  filter(region != "San Diego", region != "Santa Barbara") 
+
+da_compiled <- da_compiled %>% 
+  mutate(prop_DA = pct * .01) #create *proportion of DA variable from pct*
+
+da_compiled$collect_date <- mdy(da_compiled$collect_date) #ensure dates in MDY format
+```
+#Data Visualization
+##Line Plots by Time
+```{r}
+  ggplot(data = da_compiled, mapping = aes(x = collect_date, y = prop_DA, color = region)) + 
+    geom_point() +
+    geom_line() +
+    ylim(0,1) +
+    ggtitle("Time Plot - Proportions of High DA Crabs Caught") +
+    xlab("Harvest Dates") +
+    ylab("Proportion of Crabs with High DA Levels")
+```
+
+```{r}
+  ggplot(data = da_compiled, mapping = aes(x = month(collect_date), y = prop_DA, color = region)) + 
+    geom_point() +
+    geom_line() +
+    ylim(0,1) +
+    facet_wrap(~year(collect_date)) +
+    ggtitle("By Months, Faceted by Years") +
+    xlab("Month") +
+    ylab("Proportion of Crabs with High DA Levels")
+```
+
+```{r}
+ggplot(data = da_compiled, mapping = aes(x = month(collect_date), y = prop_DA, color = region)) + 
+  geom_point() +
+  geom_line() +
+  ylim(0,1) +
+  facet_wrap(~region) +
+  ggtitle("By Month, Faceted by Region") +
+  xlab("Month") +
+  ylab("Proportion of Crabs with High DA Levels")
+```
+##Boxplot: Distribution of Proportion of Crabs with High DA Levels by Year
+Visually confirms 2015's abnormally high levels
+```{r}
+ggplot(data = da_compiled, mapping = aes(x = as.factor(year(collect_date)), 
+                                         y = prop_DA)) + 
+  geom_boxplot(aes(fill = as.factor(year(collect_date)))) +
+  ggtitle("Boxplot: Distribution of Proportion of Crabs with High DA Levels by Year") +
+  xlab("Year") +
+  ylab("Proportion of Crabs with High DA Levels") 
+```
+Faceting may suggest Fall is the time to expect higher levels.
+```{r}
+ggplot(data = da_compiled, mapping = aes(x = as.factor(month(collect_date)), 
+                                         y = prop_DA)) + 
+  geom_boxplot() +
+  facet_wrap(~year(collect_date)) +
+  ggtitle("Boxplot: Distribution of Proportion of Crabs with High DA Levels by Month, Faceted by Year") +
+  xlab("Month of the Year") +
+  ylab("Proportion of Crabs with High DA Levels") 
+```
+##Boxplot: Distribution of Proportion of Crabs with High DA Levels by Region
+Areas to the North seem to be more at risk.
+```{r}
+ggplot(data = da_compiled, mapping = aes(x = region, 
+                                         y = prop_DA)) + 
+  geom_boxplot(aes(fill = region)) +
+  ggtitle("Boxplot: Distribution of Proportion of Crabs with High DA Levels by Region") +
+  ylab("Proportion of Crabs with High DA Levels") +
+   xlab("Region Crabs Caught")
+```
+#Expand Data
+Each sample will be expanded to represent each crab caught. A score of *1* will be assigned to catches with high levels of domoic acid (DA); 
+a score of *0* will be assigned to catches without high levels of DA. Some further data manipulation as well.
+```{r}
+datalist = list()
+
+for (i in 1:length(da_compiled$lines)){
+  
+  no.pos <- round(x = da_compiled$n[i] * (da_compiled$pct[i]*0.01), digits = 0)
+  
+  DA <- c(rep(1, no.pos), rep(0, da_compiled$n[i] - no.pos))
+  
+  dat <- tibble(collect_date = da_compiled$collect_date[i],
+                domoic_acid = as.factor(DA),
+                region = as.factor(da_compiled$region[i]),
+                month = as.factor(month(da_compiled$collect_date[i])),
+                year = as.factor(year(da_compiled$collect_date[i])))
+  
+  datalist[[i]] <- dat
+}
+
+#da_compiled <- remove() #remove to free ram 
+## ^ optional
+
+crab_data <- bind_rows(datalist) # bind together to create document
+
+#Shorten names of regios to allow for better model result interpretation
+##reference back
+crab_data <-  crab_data %>% 
+  mutate(
+  region = case_when(
+    region == "Crescent City" ~ "CrsC",
+    region == "Eureka/Trinidad" ~ "Erka/Trn",
+    region == "Fort Bragg" ~ 'FB',
+    region == "Bodega Bay" ~ 'BB',
+    region == 'Half Moon Bay/SF' ~ "HMB/SF",
+    region == "Monterey" ~ "Mntry",
+    region == "Morro Bay" ~ "MB")
+)
+
+crab_data <- crab_data %>% 
+  mutate_if(is.character, as.factor) #convert characters to factors
+
+glimpse(crab_data)
+```
+#Collecting historical water temperature data
+Source: NOAA
+
+##Crescent City Water Temps
+
+```{r}
+loc_url <- c("id=9419750&begin=20150901&end=20160831", "id=9419750&begin=20160901&end=20170831", "id=9419750&begin=20170901&end=20180831","id=9419750&begin=20180901&end=20190630")
+
+for (i in loc_url) {
+  URL <- paste0("https://tidesandcurrents.noaa.gov/cgi-bin/newdata.cgi?type=phys&",i,"&units=standard&timezone=GMT&mode=csv&interval=h")
+  download.file(url = URL, destfile = paste0("./",i,".csv"))
+}
+
+crc_temps <- data.frame()
+
+for (i in loc_url){
+  crc_temps <- bind_rows(crc_temps, read.csv(file = paste0("./",i,".csv")))
+}
+
+crc_temps <- crc_temps %>% 
+  mutate_if(is.factor, as.character) 
+
+crc_temps$DATE.TIME <- str_extract(string = crc_temps$DATE.TIME, pattern = "..........") %>% mdy()
+
+crc_temps <- crc_temps %>% 
+  mutate(
+    month = as.factor(month(DATE.TIME)),
+    year = as.factor(year(DATE.TIME))
+    ) %>% 
+  group_by(month, year) %>%
+  summarise_at(vars(WATERTEMP), funs(mean(., na.rm=T))) %>%
+  na.omit() %>%  
+  mutate(region = "CrsC")
+```
+###Monterey Water Temps
+
+```{r}
+loc_url <- c("id=9413450&begin=20150901&end=20160831", "id=9413450&begin=20160901&end=20170831", "id=9413450&begin=20170901&end=20180831","id=9413450&begin=20180901&end=20190630")
+
+for (i in loc_url) {
+  URL <- paste0("https://tidesandcurrents.noaa.gov/cgi-bin/newdata.cgi?type=phys&",i,"&units=standard&timezone=GMT&mode=csv&interval=h")
+  download.file(url = URL, destfile = paste0("./",i,".csv"))
+}
+
+mntry_temps <- data.frame()
+
+for (i in loc_url){
+  mntry_temps <- bind_rows(mntry_temps, read.csv(file = paste0("./",i,".csv")))
+}
+
+mntry_temps <- mntry_temps %>% 
+  mutate_if(is.factor, as.character) 
+
+mntry_temps$DATE.TIME <- str_extract(string = mntry_temps$DATE.TIME, pattern = "..........") %>% mdy()
+
+mntry_temps <- mntry_temps %>% 
+  mutate(
+    month = as.factor(month(DATE.TIME)),
+    year = as.factor(year(DATE.TIME))
+    ) %>%
+  group_by(month, year) %>%
+  summarise_at(vars(WATERTEMP), funs(mean(., na.rm=T))) %>%
+  na.omit() %>%  
+  mutate(region = "Mntry")
+```
+###Morro Bay Water Temps
+
+```{r}
+loc_url <- c("id=9412110&begin=20150901&end=20160831", "id=9412110&begin=20160901&end=20170831", "id=9412110&begin=20170901&end=20180831","id=9412110&begin=20180901&end=20190630")
+
+for (i in loc_url) {
+  URL <- paste0("https://tidesandcurrents.noaa.gov/cgi-bin/newdata.cgi?type=phys&",i,"&units=standard&timezone=GMT&mode=csv&interval=h")
+  download.file(url = URL, destfile = paste0("./",i,".csv"))
+}
+
+mb_temps <- data.frame()
+
+for (i in loc_url){
+  mb_temps <- bind_rows(mb_temps, read.csv(file = paste0("./",i,".csv")))
+}
+
+mb_temps <- mb_temps %>% 
+  mutate_if(is.factor, as.character) 
+
+mb_temps$DATE.TIME <- str_extract(string = mb_temps$DATE.TIME, pattern = "..........") %>% mdy()
+
+mb_temps <- mb_temps %>% 
+  mutate(
+    month = as.factor(month(DATE.TIME)),
+    year = as.factor(year(DATE.TIME))
+    ) %>%
+  group_by(month, year) %>%
+  summarise_at(vars(WATERTEMP), funs(mean(., na.rm=T))) %>%
+  na.omit() %>%  
+  mutate(region = "MB")
+```
+###Bodega Bay Water Temps
+
+```{r}
+loc_url <- c("id=9415020&begin=20150901&end=20160831", "id=9415020&begin=20160901&end=20170831", "id=9415020&begin=20170901&end=20180831","id=9415020&begin=20180901&end=20190630")
+
+for (i in loc_url) {
+  URL <- paste0("https://tidesandcurrents.noaa.gov/cgi-bin/newdata.cgi?type=phys&",i,"&units=standard&timezone=GMT&mode=csv&interval=h")
+  download.file(url = URL, destfile = paste0("./",i,".csv"))
+}
+
+bb_temps <- data.frame()
+
+for (i in loc_url){
+  bb_temps <- bind_rows(bb_temps, read.csv(file = paste0("./",i,".csv")))
+}
+
+bb_temps <- bb_temps %>% 
+  mutate_if(is.factor, as.character) 
+
+bb_temps$DATE.TIME <- str_extract(string = bb_temps$DATE.TIME, pattern = "..........") %>% mdy()
+
+bb_temps <- bb_temps %>% 
+  mutate(
+    month = as.factor(month(DATE.TIME)),
+    year = as.factor(year(DATE.TIME))
+    ) %>%
+  group_by(month, year) %>%
+  summarise_at(vars(WATERTEMP), funs(mean(., na.rm=T))) %>%
+  na.omit() %>%  
+  mutate(region = "BB")
+```
+###SF Water Temps
+
+```{r}
+loc_url <- c("id=9414290&begin=20150901&end=20160831", "id=9414290&begin=20160901&end=20170831", "id=9414290&begin=20170901&end=20180831","id=9414290&begin=20180901&end=20190630")
+
+for (i in loc_url) {
+  URL <- paste0("https://tidesandcurrents.noaa.gov/cgi-bin/newdata.cgi?type=phys&",i,"&units=standard&timezone=GMT&mode=csv&interval=h")
+  download.file(url = URL, destfile = paste0("./",i,".csv"))
+}
+
+sf_temps <- data.frame()
+
+for (i in loc_url){
+  sf_temps <- bind_rows(sf_temps, read.csv(file = paste0("./",i,".csv")))
+}
+
+sf_temps <- sf_temps %>% 
+  mutate_if(is.factor, as.character) 
+
+sf_temps$DATE.TIME <- str_extract(string = sf_temps$DATE.TIME, pattern = "..........") %>% mdy()
+
+sf_temps <- sf_temps %>% 
+  mutate(
+    month = as.factor(month(DATE.TIME)),
+    year = as.factor(year(DATE.TIME))
+    ) %>% 
+  group_by(month, year) %>%
+  summarise_at(vars(WATERTEMP), funs(mean(., na.rm=T))) %>%
+  na.omit() %>%  
+  mutate(region = "HMB/SF")
+```
+###Fort Bragg Water Temps
+
+```{r}
+loc_url <- c("id=9416841&begin=20150901&end=20160831", "id=9416841&begin=20160901&end=20170831", "id=9416841&begin=20170901&end=20180831","id=9416841&begin=20180901&end=20190630")
+
+for (i in loc_url) {
+  URL <- paste0("https://tidesandcurrents.noaa.gov/cgi-bin/newdata.cgi?type=phys&",i,"&units=standard&timezone=GMT&mode=csv&interval=h")
+  download.file(url = URL, destfile = paste0("./",i,".csv"))
+}
+
+fb_temps <- data.frame()
+
+for (i in loc_url){
+  fb_temps <- bind_rows(fb_temps, read.csv(file = paste0("./",i,".csv")))
+}
+
+fb_temps <- fb_temps %>% 
+  mutate_if(is.factor, as.character) 
+
+fb_temps$DATE.TIME <- str_extract(string = fb_temps$DATE.TIME, pattern = "..........") %>% mdy()
+
+fb_temps <- fb_temps %>% 
+  mutate(
+    month = as.factor(month(DATE.TIME)),
+    year = as.factor(year(DATE.TIME))
+    ) %>%
+  group_by(month, year) %>%
+  summarise_at(vars(WATERTEMP), funs(mean(., na.rm=T))) %>%
+  na.omit() %>%  
+  mutate(region = "FB")
+```
+###Eureka-Trinidad Water Temps
+
+```{r}
+loc_url <- c("id=9418767&begin=20150901&end=20160831", "id=9418767&begin=20160901&end=20170831", "id=9418767&begin=20170901&end=20180831","id=9418767&begin=20180901&end=20190630")
+
+for (i in loc_url) {
+  URL <- paste0("https://tidesandcurrents.noaa.gov/cgi-bin/newdata.cgi?type=phys&",i,"&units=standard&timezone=GMT&mode=csv&interval=h")
+  download.file(url = URL, destfile = paste0("./",i,".csv"))
+}
+
+et_temps <- data.frame()
+
+for (i in loc_url){
+  et_temps <- bind_rows(et_temps, read.csv(file = paste0("./",i,".csv")))
+}
+
+et_temps <- et_temps %>% 
+  mutate_if(is.factor, as.character) 
+
+et_temps$DATE.TIME <- str_extract(string = et_temps$DATE.TIME, pattern = "..........") %>% mdy()
+
+et_temps <- et_temps %>% 
+  mutate(
+    month = as.factor(month(DATE.TIME)),
+    year = as.factor(year(DATE.TIME))
+    ) %>%
+  group_by(month, year) %>%
+  summarise_at(vars(WATERTEMP), funs(mean(., na.rm=T))) %>%
+  na.omit() %>%  
+  mutate(region = "Erka/Trn")
+```
+
+#Combine Water Temp, Merge with Crab Data
+```{r}
+#bind individual region's water temp Hx into one frame
+water_temps <- bind_rows(bb_temps, crc_temps, et_temps, fb_temps, mb_temps, mntry_temps, sf_temps) 
+
+#full join water temps frame with crab data, into crab data master frame
+crab_data <- full_join(x = crab_data, y = water_temps)
+
+crab_data <- crab_data %>% 
+  mutate_if(is.character, as.factor) %>% #once again, ensure all characters are factors
+  filter(!is.na(domoic_acid))
+
+str(crab_data)
+```
+
+#One More Data Visualization
+Makes one wonder if this is at all signicant as a predictor.
+```{r}
+ggplot(data = crab_data, aes(x = domoic_acid, y = WATERTEMP)) +
+  geom_boxplot() +
+  ylab("Water Temperature (Fahrenheit") +
+  xlab("High Domoic Acid?  0 = No , 1 = Yes")
+```
+
+#Statistical Analysis
+##GLM of the Binomial Family - Logistic Model
+
+###Level Factors
+```{r}
+crab_data$region <- relevel(x = crab_data$region, ref = "MB") #reference for region will bethe furthest south = Morro Bay
+
+#year(factor) reference is automatically 2015, which is acceptable
+#month(factor) reference is automatically 1 (January), which is acceptable
+```
+
+
+###Effect of Year on DA level response:
+Address the elephant in the room: does each year bring with it signifcant variance? Yes, it does...
+That said, let's continue exploring.
+```{r}
+crab_mod <- glm(formula = domoic_acid ~ year, family = binomial(link = "logit"), data = crab_data)
+summary(crab_mod)
+```
+###Effect of Month on DA level response:
+January is the baseline here. The most signifcant increase in odds comes from August through December.
+```{r warning=FALSE}
+crab_mod <- glm(formula = domoic_acid ~ month, data = crab_data, family = "binomial")
+summary(crab_mod)
+```
+###Effect of Region on DA level response:
+Significant
+```{r warning=FALSE}
+crab_mod <- glm(formula = domoic_acid ~ region, data = crab_data, family = "binomial")
+summary(crab_mod)
+```
+###Effect of Full Model on DA level response:
+
+```{r}
+crab_mod <- glm(formula = domoic_acid ~ region + WATERTEMP + month + year, family = binomial(link = "logit"), data = crab_data)
+summary(crab_mod)
+```
+###Effect of *region*, *month*, *water temp* on DA level response:
+```{r}
+crab_mod <- glm(formula = domoic_acid ~ region + WATERTEMP + month, family = binomial(link = "logit"), data = crab_data)
+summary(crab_mod)
+```
+
+##Predict a crabbing trip with logistic model
+36% chance a crab caught would have high levels of domoic acid.
+```{r}
+crab_outing <- tibble(
+  region = "HMB/SF",    #specifies region to Half Moon Bay / SF
+  month = as.factor(8), #specifies month as August [8]
+  WATERTEMP = 61.3      #specifies water temperature to 61.3 fahrenheit
+)
+
+predict(object = crab_mod, newdata = crab_outing, type = "response")
+```
+
+#Prediction via ML technique: Classification Descision Tree
+```{r}
+#Split data 80/20 into Train/Test
+set.seed(803)
+
+n <- nrow(crab_data)
+
+test_idx <- sample.int(n = n, size = round(0.2 * n))
+
+train <- crab_data[-test_idx, ]
+
+nrow(train)
+
+test <- crab_data[test_idx, ]
+
+nrow(test)
+```
+##Benchmark against this Null Model
+```{r}
+tally(~domoic_acid, data = crab_data, format = "percent")
+```
+###Use RPART packages decision tree algorithm
+```{r}
+crab_tree <- rpart(formula = domoic_acid ~ region + month + WATERTEMP, data = train, control = rpart.control(cp = 0.001))
+
+crab_tree
+```
+```{r}
+plot(as.party(crab_tree))
+```
+
+#Test it
+```{r}
+p <- predict(object = crab_tree, newdata = test, type = "class")
+
+confusionMatrix(data = p, reference = test$domoic_acid, positive = '1')
+```
+##Predict the probability: Crab Outing
+Using Decision Tree Algorithm
+```{r}
+predict(object = crab_tree, newdata = crab_outing, type = "prob")
+```
+#Train/Test with Logistic Model
+```{r}
+crab_mod <- glm(formula = domoic_acid ~ region + WATERTEMP + month, family = binomial(link = "logit"), data = train)
+logistic_fitted.results <- predict(object = crab_mod, newdata = test, type = "response")
+logistic_fitted.results <- ifelse(logistic_fitted.results > 0.5,1,0)
+
+logistic_misClassError <- mean(logistic_fitted.results != test$domoic_acid, na.rm=TRUE)
+print(paste('Logistic Reg. Model Accuracy =',1-logistic_misClassError), quote = F)
+```
+
+
+
